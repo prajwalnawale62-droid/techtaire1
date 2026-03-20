@@ -1,6 +1,9 @@
 # Use official Node.js 20 image
 FROM node:20-alpine
 
+# Install git and python (required by baileys and native modules)
+RUN apk add --no-cache git python3 make g++
+
 # Set working directory
 WORKDIR /app
 

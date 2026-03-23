@@ -325,10 +325,3 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`✅ Techtaire Server running on port ${PORT}`);
 });
-```
-
----
-
-**Sirf yeh ek line change ki hai:**
-```
-BURST_GAP_MS = 12000 → 320000

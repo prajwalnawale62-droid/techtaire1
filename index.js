@@ -25,20 +25,50 @@ app.use(express.json());
 // ─────────────────────────────────────────────
 const MAX_MESSAGES_PER_DAY  = 3000;
 const BATCH_SIZE            = 500;
-const MESSAGES_PER_BURST    = 15;       // 15 messages per burst
-const MIN_MSG_DELAY_MS      = 4000;     // 4 sec min between messages
-const MAX_MSG_DELAY_MS      = 9000;     // 9 sec max between messages
-const MIN_BURST_GAP_MS      = 270000;   // 4.5 min min between bursts
-const MAX_BURST_GAP_MS      = 330000;   // 5.5 min max between bursts
+const MESSAGES_PER_BURST    = 15;
+const MIN_MSG_DELAY_MS      = 4000;
+const MAX_MSG_DELAY_MS      = 9000;
+const MIN_BURST_GAP_MS      = 270000;
+const MAX_BURST_GAP_MS      = 330000;
 
-// MATH:
-// 3000 / 15 = 200 bursts
-// Each burst: 15 msgs × avg 6.5s = ~97s (~1.6 min sending)
-// Each gap: avg 5 min
-// Total: 200 × (1.6 + 5) = 200 × 6.6 = 1320 min = ~16 hours ✅
+// ✅ FIX 4: Failed numbers max limit — memory leak rokne ke liye
+const MAX_FAILED_NUMBERS    = 10000;
 
 const SESSIONS_DIR = path.join(__dirname, "sessions");
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR);
+
+// ─────────────────────────────────────────────
+// ✅ FIX 3: QUEUE PERSISTENCE — file mein save karo
+// Server restart hone pe bhi queue wapas milegi
+// ─────────────────────────────────────────────
+const QUEUE_FILE = path.join(__dirname, "queue_state.json");
+
+function saveQueueState() {
+  try {
+    const state = {};
+    for (const [userId, session] of Object.entries(sessions)) {
+      state[userId] = {
+        queue: session.queue,
+        dailyCount: session.dailyCount,
+        lastReset: session.lastReset,
+        failedNumbers: session.failedNumbers,
+      };
+    }
+    fs.writeFileSync(QUEUE_FILE, JSON.stringify(state, null, 2));
+  } catch (err) {
+    console.error("[Queue] State save failed:", err.message);
+  }
+}
+
+function loadQueueState() {
+  try {
+    if (!fs.existsSync(QUEUE_FILE)) return {};
+    return JSON.parse(fs.readFileSync(QUEUE_FILE, "utf-8"));
+  } catch (err) {
+    console.error("[Queue] State load failed:", err.message);
+    return {};
+  }
+}
 
 // ─────────────────────────────────────────────
 // IN-MEMORY STORE
@@ -49,23 +79,19 @@ const sessions = {};
 // UTILITY FUNCTIONS
 // ─────────────────────────────────────────────
 
-// Random number between min and max
 function randomBetween(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// GUARANTEED sleep — always runs no matter what
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Validate phone number — only digits, 10–15 length
 function isValidNumber(number) {
   const cleaned = number.replace(/\D/g, "");
   return cleaned.length >= 10 && cleaned.length <= 15;
 }
 
-// Clean number — remove all non-digits
 function cleanNumber(number) {
   return number.replace(/\D/g, "");
 }
@@ -78,6 +104,7 @@ function resetDailyCount(userId) {
   if (sessions[userId] && sessions[userId].lastReset !== today) {
     sessions[userId].dailyCount = 0;
     sessions[userId].lastReset = today;
+    saveQueueState(); // ✅ FIX 3: reset ke baad save karo
     console.log(`[${userId}] Daily count reset for new day`);
   }
 }
@@ -94,7 +121,16 @@ async function createSession(userId) {
   if (!fs.existsSync(sessionPath)) fs.mkdirSync(sessionPath, { recursive: true });
 
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-  const { version } = await fetchLatestBaileysVersion();
+
+  // ✅ Fallback version — agar network slow ho
+  let version;
+  try {
+    const result = await fetchLatestBaileysVersion();
+    version = result.version;
+  } catch (err) {
+    version = [2, 3000, 1023625794]; // safe fallback version
+    console.warn(`[${userId}] fetchLatestBaileysVersion failed, using fallback:`, version);
+  }
 
   const sock = makeWASocket({
     version,
@@ -105,16 +141,20 @@ async function createSession(userId) {
     syncFullHistory: false,
   });
 
+  // ✅ FIX 3: Pehle se saved queue restore karo
+  const savedState = loadQueueState();
+  const saved = savedState[userId] || {};
+
   sessions[userId] = {
     sock,
     status: "waiting_qr",
     qr: null,
-    dailyCount: 0,
-    lastReset: new Date().toDateString(),
-    queue: [],
+    dailyCount: saved.dailyCount || 0,
+    lastReset: saved.lastReset || new Date().toDateString(),
+    queue: saved.queue || [],        // ✅ Queue restore
     isSending: false,
     isPaused: false,
-    failedNumbers: [],
+    failedNumbers: saved.failedNumbers || [],
   };
 
   sock.ev.on("connection.update", (update) => {
@@ -132,6 +172,12 @@ async function createSession(userId) {
       sessions[userId].qr = null;
       io.to(`user_${userId}`).emit("connected", { userId });
       console.log(`[${userId}] WhatsApp Connected!`);
+
+      // ✅ FIX 3: Connect hone pe agar queue thi toh resume karo
+      if (sessions[userId].queue.length > 0 && !sessions[userId].isSending) {
+        console.log(`[${userId}] Restored queue found (${sessions[userId].queue.length} items), resuming...`);
+        processQueue(userId);
+      }
     }
 
     if (connection === "close") {
@@ -146,8 +192,10 @@ async function createSession(userId) {
         const delay = randomBetween(5000, 15000);
         setTimeout(() => createSession(userId), delay);
       } else {
+        const sessionPath = path.join(SESSIONS_DIR, userId);
         fs.rmSync(sessionPath, { recursive: true, force: true });
         delete sessions[userId];
+        saveQueueState(); // ✅ FIX 3: logout pe state clean karo
       }
     }
   });
@@ -159,22 +207,28 @@ async function createSession(userId) {
 
 // ─────────────────────────────────────────────
 // SEND SINGLE MESSAGE
-// sleep() is OUTSIDE try/catch — ALWAYS runs
 // ─────────────────────────────────────────────
 async function sendSingleMessage(userId, number, message) {
   const session = sessions[userId];
   const cleaned = cleanNumber(number);
   const jid = `${cleaned}@s.whatsapp.net`;
 
+  // ✅ FIX 1: Pause check sendSingleMessage ke ANDAR bhi — mid-burst bhi pause hoga
+  if (session.isPaused) {
+    console.log(`[${userId}] ⏸ Paused mid-burst, skipping ${cleaned}`);
+    return "paused"; // caller ko batao ki paused hai
+  }
+
   try {
-    // Simulate typing like a real human
     await session.sock.sendPresenceUpdate("composing", jid);
     await sleep(randomBetween(1000, 2500));
     await session.sock.sendPresenceUpdate("paused", jid);
 
-    // Send message
     await session.sock.sendMessage(jid, { text: message });
     session.dailyCount++;
+
+    // ✅ FIX 3: Har message ke baad state save karo
+    saveQueueState();
 
     io.to(`user_${userId}`).emit("message_sent", {
       userId,
@@ -186,8 +240,12 @@ async function sendSingleMessage(userId, number, message) {
     console.log(`[${userId}] ✅ Sent to ${cleaned} | Total: ${session.dailyCount}`);
 
   } catch (err) {
-    // Log failure but do NOT return — sleep() must still run below
-    session.failedNumbers.push(cleaned);
+    // ✅ FIX 4: failedNumbers max limit check
+    if (session.failedNumbers.length < MAX_FAILED_NUMBERS) {
+      session.failedNumbers.push(cleaned);
+    } else {
+      console.warn(`[${userId}] ⚠️ failedNumbers limit reached, not adding more`);
+    }
 
     io.to(`user_${userId}`).emit("message_failed", {
       userId,
@@ -198,7 +256,7 @@ async function sendSingleMessage(userId, number, message) {
     console.log(`[${userId}] ❌ Failed: ${cleaned} — ${err.message}`);
   }
 
-  // ✅ GUARANTEED DELAY — error aaye ya na aaye, ye HAMESHA chalega
+  // ✅ GUARANTEED DELAY — hamesha chalega
   const msgDelay = randomBetween(MIN_MSG_DELAY_MS, MAX_MSG_DELAY_MS);
   console.log(`[${userId}] ⏱ Next message in ${(msgDelay / 1000).toFixed(1)}s`);
   await sleep(msgDelay);
@@ -211,7 +269,6 @@ async function processBatch(userId, batch) {
   const session = sessions[userId];
   if (!session || session.status !== "connected") return;
 
-  // Filter invalid numbers before starting
   const validBatch = batch.filter((item) => {
     if (!isValidNumber(item.number)) {
       io.to(`user_${userId}`).emit("message_failed", {
@@ -229,19 +286,18 @@ async function processBatch(userId, batch) {
 
   while (i < validBatch.length) {
 
-    // Stop if session lost
     if (!sessions[userId] || sessions[userId].status !== "connected") {
       console.log(`[${userId}] Session lost. Stopping batch.`);
       break;
     }
 
-    // Stop if paused
+    // ✅ FIX 1: Pause check burst ke START pe
     if (sessions[userId].isPaused) {
       io.to(`user_${userId}`).emit("queue_paused", {
         userId,
-        message: "Queue is paused. Call /messages/resume to continue.",
+        message: "Queue paused. Call /messages/resume to continue.",
       });
-      console.log(`[${userId}] Queue paused by user.`);
+      console.log(`[${userId}] Queue paused.`);
       break;
     }
 
@@ -258,11 +314,9 @@ async function processBatch(userId, batch) {
 
     console.log(`[${userId}] 🚀 Burst #${burstNumber} started — ${burst.length} messages`);
 
-    // Send each message in this burst
     for (const item of burst) {
       resetDailyCount(userId);
 
-      // Daily limit check
       if (session.dailyCount >= MAX_MESSAGES_PER_DAY) {
         io.to(`user_${userId}`).emit("limit_reached", {
           userId,
@@ -272,12 +326,20 @@ async function processBatch(userId, batch) {
         return;
       }
 
-      await sendSingleMessage(userId, item.number, item.message);
+      // ✅ FIX 1: sendSingleMessage se "paused" return aaye toh burst rok do
+      const result = await sendSingleMessage(userId, item.number, item.message);
+      if (result === "paused") {
+        io.to(`user_${userId}`).emit("queue_paused", {
+          userId,
+          message: "Queue paused mid-burst. Call /messages/resume to continue.",
+        });
+        console.log(`[${userId}] Queue paused mid-burst.`);
+        return; // processBatch se bahar nikal jao
+      }
     }
 
     i += MESSAGES_PER_BURST;
 
-    // Gap between bursts (only if more messages remain)
     if (i < validBatch.length) {
       const burstGap = randomBetween(MIN_BURST_GAP_MS, MAX_BURST_GAP_MS);
       const gapMin = (burstGap / 60000).toFixed(1);
@@ -300,16 +362,27 @@ async function processBatch(userId, batch) {
 
 // ─────────────────────────────────────────────
 // QUEUE PROCESSOR
+// ✅ FIX 2: Resume pe double processing nahi hoga
+// isSending flag se guard already hai — resume pe processQueue
+// sirf tab call hoti hai jab isSending === false ho
 // ─────────────────────────────────────────────
 async function processQueue(userId) {
   const session = sessions[userId];
-  if (!session || session.isSending) return;
+  if (!session || session.isSending) return; // ✅ Double processing blocked
 
   session.isSending = true;
   console.log(`[${userId}] Queue processing started`);
 
   while (session.queue.length > 0) {
+
+    // ✅ FIX 1: Queue loop mein bhi pause check
+    if (session.isPaused) {
+      console.log(`[${userId}] Queue paused, exiting queue loop.`);
+      break;
+    }
+
     const batch = session.queue.splice(0, BATCH_SIZE);
+    saveQueueState(); // ✅ FIX 3: Batch remove hone ke baad save
 
     io.to(`user_${userId}`).emit("batch_started", {
       userId,
@@ -322,21 +395,23 @@ async function processQueue(userId) {
 
   session.isSending = false;
 
-  io.to(`user_${userId}`).emit("queue_complete", {
-    userId,
-    totalSent: session.dailyCount,
-    totalFailed: session.failedNumbers.length,
-    failedNumbers: session.failedNumbers,
-  });
-
-  console.log(`[${userId}] ✅ Queue complete. Sent: ${session.dailyCount} | Failed: ${session.failedNumbers.length}`);
+  // ✅ FIX 1: Agar paused hai toh complete emit mat karo
+  if (!session.isPaused) {
+    io.to(`user_${userId}`).emit("queue_complete", {
+      userId,
+      totalSent: session.dailyCount,
+      totalFailed: session.failedNumbers.length,
+      failedNumbers: session.failedNumbers,
+    });
+    console.log(`[${userId}] ✅ Queue complete. Sent: ${session.dailyCount} | Failed: ${session.failedNumbers.length}`);
+    saveQueueState(); // ✅ Final save
+  }
 }
 
 // ─────────────────────────────────────────────
 // REST API ROUTES
 // ─────────────────────────────────────────────
 
-// Health check
 app.get("/", (req, res) => {
   res.json({
     status: "Techtaire Server Running 🚀",
@@ -351,7 +426,6 @@ app.get("/", (req, res) => {
   });
 });
 
-// Start session
 app.post("/session/start", async (req, res) => {
   const { userId } = req.body;
   if (!userId) return res.status(400).json({ error: "userId required" });
@@ -359,7 +433,6 @@ app.post("/session/start", async (req, res) => {
   res.json(result);
 });
 
-// Session status
 app.get("/session/status/:userId", (req, res) => {
   const { userId } = req.params;
   const session = sessions[userId];
@@ -376,7 +449,6 @@ app.get("/session/status/:userId", (req, res) => {
   });
 });
 
-// Logout session
 app.post("/session/logout", async (req, res) => {
   const { userId } = req.body;
   if (!userId) return res.status(400).json({ error: "userId required" });
@@ -386,10 +458,10 @@ app.post("/session/logout", async (req, res) => {
   const sessionPath = path.join(SESSIONS_DIR, userId);
   fs.rmSync(sessionPath, { recursive: true, force: true });
   delete sessions[userId];
+  saveQueueState(); // ✅ FIX 3: Logout pe state clean
   res.json({ success: true, message: `Session ${userId} logged out` });
 });
 
-// Send bulk messages
 app.post("/messages/send", (req, res) => {
   const { userId, messages } = req.body;
   if (!userId) return res.status(400).json({ error: "userId required" });
@@ -408,7 +480,9 @@ app.post("/messages/send", (req, res) => {
 
   const toSend = messages.slice(0, remaining);
   session.queue.push(...toSend);
-  processQueue(userId);
+  saveQueueState(); // ✅ FIX 3: Queue add hone ke baad save
+
+  processQueue(userId); // ✅ FIX 2: isSending guard andar hai, safe hai
 
   res.json({
     success: true,
@@ -419,28 +493,32 @@ app.post("/messages/send", (req, res) => {
   });
 });
 
-// Pause queue
 app.post("/messages/pause", (req, res) => {
   const { userId } = req.body;
   if (!userId) return res.status(400).json({ error: "userId required" });
   const session = sessions[userId];
   if (!session) return res.status(404).json({ error: "Session not found" });
   session.isPaused = true;
-  res.json({ success: true, message: "Queue will pause after current message" });
+  // ✅ FIX 1: Pause turant kaam karega — next message check pe rok jaayega
+  res.json({ success: true, message: "Queue pausing — will stop at next message" });
 });
 
-// Resume queue
 app.post("/messages/resume", (req, res) => {
   const { userId } = req.body;
   if (!userId) return res.status(400).json({ error: "userId required" });
   const session = sessions[userId];
   if (!session) return res.status(404).json({ error: "Session not found" });
+
   session.isPaused = false;
-  processQueue(userId);
+
+  // ✅ FIX 2: Sirf tab processQueue call karo jab already nahi chal rahi
+  if (!session.isSending && session.queue.length > 0) {
+    processQueue(userId);
+  }
+
   res.json({ success: true, message: "Queue resumed" });
 });
 
-// Get failed numbers
 app.get("/messages/failed/:userId", (req, res) => {
   const { userId } = req.params;
   const session = sessions[userId];
@@ -452,16 +530,15 @@ app.get("/messages/failed/:userId", (req, res) => {
   });
 });
 
-// Clear failed numbers
 app.delete("/messages/failed/:userId", (req, res) => {
   const { userId } = req.params;
   const session = sessions[userId];
   if (!session) return res.status(404).json({ error: "Session not found" });
   session.failedNumbers = [];
+  saveQueueState(); // ✅ FIX 3: Clear ke baad save
   res.json({ success: true, message: "Failed numbers list cleared" });
 });
 
-// Daily stats
 app.get("/messages/stats/:userId", (req, res) => {
   const { userId } = req.params;
   const session = sessions[userId];
@@ -500,6 +577,21 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     console.log(`[Socket] Client disconnected: ${socket.id}`);
   });
+});
+
+// ─────────────────────────────────────────────
+// GRACEFUL SHUTDOWN — Ctrl+C pe bhi state save ho
+// ─────────────────────────────────────────────
+process.on("SIGINT", () => {
+  console.log("\n[Server] Shutting down — saving queue state...");
+  saveQueueState();
+  process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+  console.log("\n[Server] SIGTERM — saving queue state...");
+  saveQueueState();
+  process.exit(0);
 });
 
 // ─────────────────────────────────────────────

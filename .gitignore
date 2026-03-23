@@ -2,3 +2,4 @@ node_modules/
 sessions/
 .env
 *.log
+queue_state.json

@@ -15,10 +15,25 @@ const pino = require("pino");
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*" },
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST", "DELETE", "OPTIONS"],
+    credentials: true
+  },
 });
 
 app.use(express.json());
+
+// ✅ CORS FIX — Vercel se Railway pe calls allow karo
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200);
+  }
+  next();
+});
 
 // ─────────────────────────────────────────────
 // CONFIG — 3000 messages in ~16 hours

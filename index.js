@@ -588,7 +588,7 @@ io.on("connection", (socket) => {
     const session = sessions[userId];
     if (session) {
       socket.emit("status", { userId, status: session.status });
-      if (session.qr) socket.emit("qr", { userId, qr: session.qr });
+      // ✅ Join pe QR mat bhejo — sirf status bhejo
     }
   });
  
